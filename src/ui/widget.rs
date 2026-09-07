@@ -22,13 +22,13 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
         title_bar(app, ui);
-        ui.add_space(6.0);
-        link_row(ui, &app.view, NicKind::Ethernet);
-        ui.add_space(2.0);
+        ui.add_space(8.0);
+        ethernet_switch(app, ui);
+        ui.add_space(8.0);
         link_row(ui, &app.view, NicKind::Wifi);
-        ui.add_space(9.0);
-        buttons(app, ui);
-        ui.add_space(7.0);
+        ui.add_space(8.0);
+        options(app, ui);
+        ui.add_space(6.0);
         banner(app, ui);
     });
 }
@@ -225,89 +225,174 @@ fn detail_text(nic: Option<&Nic>, kind: NicKind, _view: &View) -> String {
     }
 }
 
-fn buttons(app: &mut App, ui: &mut Ui) {
+/// The main control: one switch that turns Ethernet on and off.
+///
+/// The mental model this serves is "simulate unplugging the cable" -- the user has Wi-Fi already
+/// set up, plugs in Ethernet, and wants a way to fall back to Wi-Fi without physically pulling
+/// the cable. So this is a switch, not a set of modes.
+fn ethernet_switch(app: &mut App, ui: &mut Ui) {
     let busy = app.pending.is_some();
-    let active = app.view.active_mode();
-    let policy_blocks_wifi = !app.view.policy.policy.permits_manual_wifi();
-    let eth_unplugged = app
+    let off = app.view.ethernet_is_off();
+    let unplugged = app
         .view
         .eth
         .as_ref()
         .map(|n| !n.media_connected)
         .unwrap_or(true);
-    let eth_detached = app.view.eth_ip_detached;
+    let wifi_ready = app
+        .view
+        .wifi_status
+        .as_ref()
+        .map(|w| w.radio_on)
+        .unwrap_or(false);
 
-    // Two rows of two rather than four across: at 330 px, four buttons leave no room for
-    // "Wi-Fi only" to be readable, and truncating the one mode that needs explaining is the
-    // wrong trade.
-    let w = (ui.available_width() - 8.0) / 2.0;
+    // Turning Ethernet off with no Wi-Fi to fall back to would take the machine offline, so the
+    // switch refuses rather than letting the worker discover it and abort.
+    let can_turn_off = wifi_ready;
+    let enabled = !busy && !unplugged && (off || can_turn_off);
 
-    let mut button = |ui: &mut Ui, mode: Mode, text: &str, on: bool, enabled: bool, tip: &str| {
-        let fill = if on { theme::BTN_ON } else { theme::BTN };
-        let resp = ui.add_enabled(
-            enabled && !busy,
-            egui::Button::new(RichText::new(text).color(theme::TEXT).size(12.0))
-                .fill(fill)
-                .min_size(egui::vec2(w, 26.0))
-                .corner_radius(7.0),
-        );
-        let resp = resp.on_disabled_hover_text(tip.to_string());
-        if resp.on_hover_text(tip.to_string()).clicked() {
-            app.request(mode);
-        }
+    // Labels and switch on separate rows, positioned with explicit spacing.
+    //
+    // The obvious nesting -- a vertical of labels beside a right-to-left switch inside one
+    // horizontal -- silently rendered no switch at all: the inner vertical claims the full
+    // available width, so the right-aligned child had nothing to draw into. Explicit spacing
+    // cannot fail that way.
+    ui.label(RichText::new("Ethernet").color(theme::TEXT).size(15.0).strong());
+    ui.label(
+        RichText::new(ethernet_detail(&app.view))
+            .color(theme::MUTED)
+            .size(10.5),
+    );
+    ui.add_space(7.0);
+
+    let tip = if unplugged {
+        "No cable is connected.".to_string()
+    } else if !off && !can_turn_off {
+        "Wi-Fi is off, so there would be nothing to fall back to.".to_string()
+    } else if off {
+        "Turn Ethernet back on.".to_string()
+    } else if app.prefs.keep_lan_when_off {
+        "Move the internet to Wi-Fi, keeping Ethernet's own network reachable.".to_string()
+    } else {
+        "Switch Ethernet off, as if you had unplugged the cable.".to_string()
     };
 
     ui.horizontal(|ui| {
-        button(
-            ui,
-            Mode::Ethernet,
-            "Ethernet",
-            active == Some(Mode::Ethernet) && !eth_detached,
-            !eth_unplugged,
-            if eth_unplugged {
-                "The Ethernet cable is not connected."
+        // No status word here: the detail line above already says what state Ethernet is in,
+        // and repeating it beside the switch just read as stutter.
+        let pad = (ui.available_width() - 56.0).max(0.0);
+        ui.add_space(pad);
+        let resp = switch(ui, !off, enabled);
+        if resp
+            .on_disabled_hover_text(tip.clone())
+            .on_hover_text(tip)
+            .clicked()
+        {
+            if off {
+                app.request(Mode::Ethernet);
+            } else if app.prefs.keep_lan_when_off {
+                app.request(Mode::Wifi);
             } else {
-                "Send traffic over the cable."
-            },
-        );
-        button(
-            ui,
-            Mode::Wifi,
-            "Wi-Fi",
-            active == Some(Mode::Wifi) && !eth_detached,
-            !policy_blocks_wifi,
-            if policy_blocks_wifi {
-                "Group Policy prevents Wi-Fi while Ethernet is connected."
-            } else {
-                "Send traffic over Wi-Fi. Ethernet stays connected and keeps its own subnet."
-            },
-        );
-    });
-    ui.horizontal(|ui| {
-        button(
-            ui,
-            Mode::WifiOnly,
-            "Wi-Fi only",
-            eth_detached,
-            !policy_blocks_wifi,
-            if policy_blocks_wifi {
-                "Group Policy prevents Wi-Fi while Ethernet is connected."
-            } else {
-                "Detach Ethernet's IP stack entirely: no address, no routes, no DNS. The cable                  stays plugged in and the adapter stays enabled."
-            },
-        );
-        button(
-            ui,
-            Mode::Auto,
-            "Auto",
-            active == Some(Mode::Auto),
-            true,
-            "Let Windows decide again.",
-        );
+                app.request(Mode::WifiOnly);
+            }
+        }
     });
 }
 
-/// The one line under the buttons. Only the most important thing is shown, in priority order.
+/// A pill switch, drawn rather than composed from egui widgets so the on/off state reads at a
+/// glance from across the desk.
+fn switch(ui: &mut Ui, on: bool, enabled: bool) -> egui::Response {
+    let size = egui::vec2(52.0, 28.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let p = ui.painter();
+
+    let (track, knob) = match (enabled, on) {
+        (false, _) => (theme::BTN, theme::IDLE),
+        (true, true) => (theme::BTN_ON, theme::ACTIVE),
+        (true, false) => (theme::BTN, theme::MUTED),
+    };
+    p.rect_filled(rect, rect.height() / 2.0, track);
+    if enabled && resp.hovered() {
+        p.rect_stroke(
+            rect,
+            rect.height() / 2.0,
+            egui::Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let r = rect.height() / 2.0 - 4.0;
+    let cx = if on {
+        rect.right() - r - 4.0
+    } else {
+        rect.left() + r + 4.0
+    };
+    p.circle_filled(egui::pos2(cx, rect.center().y), r, knob);
+
+    // A label inside the track, so the state does not rely on knob position or colour alone.
+    let (text, tx) = if on {
+        ("ON", rect.left() + 14.0)
+    } else {
+        ("OFF", rect.right() - 16.0)
+    };
+    p.text(
+        egui::pos2(tx, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(9.5),
+        if enabled { theme::TEXT } else { theme::IDLE },
+    );
+    resp
+}
+
+/// The line under "Ethernet": what it is doing right now.
+fn ethernet_detail(view: &View) -> String {
+    let Some(n) = view.eth.as_ref() else {
+        return "adapter not found".into();
+    };
+    if !n.media_connected {
+        return "no cable connected".into();
+    }
+    if view.eth_ip_detached {
+        // Deliberately explicit. This state is indistinguishable from an unplugged cable if you
+        // only look at addresses and routes, and the whole point is that the cable is still in.
+        return "switched off — cable still connected".into();
+    }
+    if view.active_mode() == Some(Mode::Wifi) {
+        // The soft flavour of off: still addressed, but the internet is on Wi-Fi.
+        return "switched off — LAN still reachable".into();
+    }
+    let speed = n.link_speed_text().unwrap_or_else(|| "connected".into());
+    match n.ipv4.iter().find(|a| !a.is_link_local()) {
+        Some(ip) => format!("in use · {speed} · {ip}"),
+        None => format!("in use · {speed}"),
+    }
+}
+
+/// The secondary choice: what "off" should mean.
+fn options(app: &mut App, ui: &mut Ui) {
+    let mut keep = app.prefs.keep_lan_when_off;
+    let resp = ui.add_enabled(
+        app.pending.is_none(),
+        egui::Checkbox::new(
+            &mut keep,
+            RichText::new("Keep Ethernet's own network reachable")
+                .color(theme::MUTED)
+                .size(10.5),
+        ),
+    );
+    if resp
+        .on_hover_text(
+            "On: switching off only moves the internet to Wi-Fi, and things on the Ethernet \
+             network stay reachable.\nOff: Ethernet is switched off completely, as if unplugged.",
+        )
+        .changed()
+    {
+        app.prefs.keep_lan_when_off = keep;
+        let _ = crate::config::save_prefs(&app.prefs);
+    }
+}
+
+/// The one status line at the bottom. Only the most important thing is shown, in priority order.
 fn banner(app: &App, ui: &mut Ui) {
     let (text, colour) = banner_text(app);
     ui.label(RichText::new(text).color(colour).size(10.5));

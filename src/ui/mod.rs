@@ -75,6 +75,14 @@ impl View {
         }
     }
 
+    /// Is Ethernet currently switched off, in the user's sense of "as if unplugged"?
+    ///
+    /// True for either flavour of off: the IP stack detached, or Ethernet demoted so Wi-Fi
+    /// carries the traffic.
+    pub fn ethernet_is_off(&self) -> bool {
+        self.eth_ip_detached || self.active_mode() == Some(Mode::Wifi)
+    }
+
     /// Which mode is in effect, for highlighting a button.
     ///
     /// Live state first where it is unambiguous, then the journal. Deliberately returns `None`
@@ -109,6 +117,7 @@ pub struct App {
     tray: Option<tray::Tray>,
     visible: bool,
     hwnd_done: bool,
+    logged_metrics: bool,
 }
 
 impl App {
@@ -149,6 +158,7 @@ impl App {
             tray,
             visible: true,
             hwnd_done: false,
+            logged_metrics: false,
         }
     }
 
@@ -265,7 +275,19 @@ impl eframe::App for App {
             .stroke(egui::Stroke::new(1.0, theme::BORDER));
         egui::CentralPanel::default()
             .frame(panel)
-            .show(ui, |ui| widget::draw(self, ui));
+            .show(ui, |ui| {
+                if !self.logged_metrics {
+                    self.logged_metrics = true;
+                    let r = ui.max_rect();
+                    crate::log::line(&format!(
+                        "layout: pixels_per_point={:.2} usable={}x{} points",
+                        ui.ctx().pixels_per_point(),
+                        r.width().round(),
+                        r.height().round()
+                    ));
+                }
+                widget::draw(self, ui)
+            });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -280,8 +302,8 @@ pub fn run() -> Result<(), String> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LinkSwitch")
-        .with_inner_size([340.0, 244.0])
-        .with_min_inner_size([340.0, 244.0])
+        .with_inner_size([348.0, 262.0])
+        .with_min_inner_size([348.0, 262.0])
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()

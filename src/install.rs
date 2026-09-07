@@ -124,6 +124,11 @@ pub fn install(keep_wifi: bool, autostart: bool) -> InstallOutcome {
     if cfg.wifi.is_none() {
         cfg.wifi = wifi.first().map(|n| AdapterRef::from(*n));
     }
+    if cfg.wifi_profile_hint.is_none() {
+        if let Some(p) = crate::net::wifi::status().and_then(|w| w.profile) {
+            cfg.wifi_profile_hint = Some(p);
+        }
+    }
     describe_choice(&mut msgs, &cfg);
 
     // 4. Optional, opt-in: stop Windows blocking Wi-Fi while Ethernet is up.
@@ -264,7 +269,18 @@ pub fn uninstall() -> InstallOutcome {
 /// auditable command line is easier for a reader of an open-source security-sensitive tool to
 /// check than fifty lines of ACL construction.
 fn harden_dacl(dir: &Path) -> std::io::Result<()> {
-    let out = Command::new("icacls")
+    // Two steps, and the second is not optional.
+    //
+    // `/inheritance:r` strips inherited ACEs from everything it touches. The `(OI)(CI)` flags on
+    // the grants are *container* inheritance flags, so when the same command is applied to an
+    // existing child file with `/T` it cannot set them, fails, and -- under `/C` -- carries on
+    // quietly. The result observed on this machine: the worker log ended up with no usable ACE
+    // at all and became unreadable even to the user who owns the machine, which is precisely
+    // the file someone needs when they are trying to work out what went wrong.
+    //
+    // So: set the inheritable ACL on the directory alone, then reset every existing child so it
+    // re-inherits from the parent.
+    let set = Command::new("icacls")
         .arg(dir)
         .args([
             "/inheritance:r",
@@ -274,19 +290,28 @@ fn harden_dacl(dir: &Path) -> std::io::Result<()> {
             "*S-1-5-18:(OI)(CI)F", // SYSTEM
             "/grant:r",
             "*S-1-5-32-545:(OI)(CI)RX", // Users: read only
-            "/T",
-            "/C",
             "/Q",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ))
+    if !set.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&set.stderr).trim().to_string(),
+        ));
     }
+
+    // Make existing children inherit what we just set, rather than keeping stripped ACLs.
+    let reset = Command::new("icacls")
+        .arg(dir)
+        .args(["/reset", "/T", "/C", "/Q"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    if !reset.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&reset.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Add or remove the per-user startup entry.

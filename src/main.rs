@@ -79,7 +79,10 @@ fn main() -> ExitCode {
                     argv.push("--no-autostart");
                 }
                 return match install::self_elevate(&argv) {
-                    Ok(code) => ExitCode::from(code as u8),
+                    Ok(code) => {
+                        report_elevated_run(code, "Install");
+                        ExitCode::from(code as u8)
+                    }
                     Err(e) => {
                         eprintln!("linkswitch: {e}");
                         ExitCode::FAILURE
@@ -88,8 +91,10 @@ fn main() -> ExitCode {
             }
             log::init(config::worker_log_path(), "install");
             let outcome = install::install(keep_wifi, autostart);
+            // Through the log, not println!: this process was launched with "runas" and its
+            // console is discarded, so the unelevated parent reads these back from the file.
             for m in &outcome.messages {
-                println!("{m}");
+                log::line(m);
             }
             if outcome.ok {
                 println!("\nLinkSwitch is ready. Run it with no arguments to open the widget.");
@@ -102,7 +107,10 @@ fn main() -> ExitCode {
         Cmd::Uninstall => {
             if !elevate::is_elevated() {
                 return match install::self_elevate(&["--uninstall"]) {
-                    Ok(code) => ExitCode::from(code as u8),
+                    Ok(code) => {
+                        report_elevated_run(code, "Uninstall");
+                        ExitCode::from(code as u8)
+                    }
                     Err(e) => {
                         eprintln!("linkswitch: {e}");
                         ExitCode::FAILURE
@@ -112,7 +120,7 @@ fn main() -> ExitCode {
             log::init(config::worker_log_path(), "uninstall");
             let outcome = install::uninstall();
             for m in &outcome.messages {
-                println!("{m}");
+                log::line(m);
             }
             if outcome.ok {
                 ExitCode::SUCCESS
@@ -153,6 +161,36 @@ fn attach_console_if_cli() {
     unsafe {
         use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// Say what the elevated child did.
+///
+/// A process launched with ShellExecuteEx "runas" gets its own console, so everything it prints
+/// is discarded -- `--install` otherwise returns to the prompt having said nothing at all,
+/// whether it succeeded or failed. The child writes to the log, so the parent reads the tail of
+/// it back.
+fn report_elevated_run(code: u32, what: &str) {
+    let path = config::worker_log_path();
+    let tail: Vec<String> = std::fs::read_to_string(&path)
+        .map(|s| {
+            s.lines()
+                .rev()
+                .take_while(|l| !l.contains("--- linkswitch"))
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default();
+    for l in &tail {
+        println!("{l}");
+    }
+    if code == 0 {
+        println!("{what} completed. Log: {}", path.display());
+    } else {
+        eprintln!("{what} failed with exit code {code}. Log: {}", path.display());
     }
 }
 

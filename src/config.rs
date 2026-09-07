@@ -253,6 +253,13 @@ pub struct UserPrefs {
     pub pos: Option<(f32, f32)>,
     #[serde(default)]
     pub start_hidden: bool,
+    /// What switching Ethernet off should mean.
+    ///
+    /// `false` (the default) detaches Ethernet's IP stack, which is what actually looks like an
+    /// unplugged cable. `true` only demotes it, so its own subnet -- a NAS, a printer -- keeps
+    /// working while the internet moves to Wi-Fi.
+    #[serde(default)]
+    pub keep_lan_when_off: bool,
 }
 
 impl Default for UserPrefs {
@@ -261,6 +268,7 @@ impl Default for UserPrefs {
             schema: SCHEMA,
             pos: None,
             start_hidden: false,
+            keep_lan_when_off: false,
         }
     }
 }

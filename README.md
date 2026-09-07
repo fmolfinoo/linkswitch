@@ -1,6 +1,6 @@
 # LinkSwitch
 
-Choose whether Windows sends your traffic over **Ethernet** or **Wi-Fi** — without unplugging the cable.
+An on/off switch for Ethernet — **without unplugging the cable**.
 
 ![The LinkSwitch widget](docs/widget.png)
 
@@ -12,65 +12,82 @@ associated, still showing full bars — it just quietly loses.
 Two separate things cause this, and most advice only mentions the first:
 
 1. **Routing.** Windows picks an outbound interface by longest-prefix match, then by the lowest
-   *total metric* (route metric + interface metric). It assigns those metrics automatically from
-   link speed. On the machine this was built on, Ethernet gets **5** and Wi-Fi gets **30**, so the
-   moment the cable goes in, Ethernet wins every new connection.
+   *total metric* (route metric + interface metric), and assigns those metrics automatically from
+   link speed. On the machine this was built on, a 1 Gbps Ethernet link gets **25** against Wi-Fi's
+   **35**, so the moment the cable goes in, Ethernet wins every new connection.
 
-2. **Association.** Windows Connection Manager's *"minimize the number of simultaneous connections"*
-   policy is **on by default**, and it blocks Wi-Fi from *auto*-connecting whenever a preferred
-   network type — Ethernet — is already up. So after a reboot with the cable in, Wi-Fi may not come
-   back at all.
+2. **Association.** Windows Connection Manager's *"minimize the number of simultaneous
+   connections"* policy is **on by default** — and its registry value being *absent* means enabled,
+   not disabled, which is easy to get backwards. It stops Wi-Fi *auto*-connecting whenever a
+   preferred network type is already up, and Ethernet always counts as preferred. Observed
+   directly here: plugging the cable in dropped an associated Wi-Fi connection within seconds.
 
-LinkSwitch handles both. It raises the losing interface's metric so the other one wins, and it
-associates Wi-Fi itself before switching, which the policy permits because manually-connected
-networks are on its keep-list.
+The second one is why a naive "just change the metric" tool does not work. By the time you want
+Wi-Fi, Windows has often already disconnected it, so there is nothing to switch to. LinkSwitch
+connects Wi-Fi itself first — which the policy permits, because manually-connected networks are on
+its keep-list — and only then switches Ethernet off.
 
 Nothing is disabled and the cable never comes out.
 
-## The three modes
+## What it does
 
-| Mode | Internet goes over | Ethernet's own subnet | Ethernet's IP stack |
-|---|---|---|---|
-| **Ethernet** | the cable | works | attached |
-| **Wi-Fi** | Wi-Fi | still works — NAS, printer, whatever | attached |
-| **Wi-Fi only** | Wi-Fi | gone | **detached** |
+One switch. Turn Ethernet **off** and Windows behaves exactly as if you had pulled the cable —
+your traffic falls back to the Wi-Fi you were already using. Turn it back **on** and Ethernet
+returns. The cable never moves.
 
-**Wi-Fi** is the everyday one. Ethernet stays enabled and addressed, so anything on the wire
-keeps working; only your *internet* moves.
+Measured on the machine this was built on, switching off takes **1.2 s** and produces:
 
-**Wi-Fi only** is for when you want Ethernet to contribute nothing at all. Its IP stack is
-detached outright: no address, no routes of any kind, no DNS servers, no DHCP, and it disappears
-from the Windows network list. NetBIOS and SMB go with it. The cable stays plugged in and the
-adapter stays enabled the whole time.
+| | Ethernet on | Ethernet off |
+|---|---|---|
+| IP address | 192.168.1.50 | **none** |
+| routes | 7 | **0** |
+| DNS servers | 192.168.1.1 | **none** |
+| in the network list | yes | **no** |
+| adapter status | Up, 1 Gbps, connected | **Up, 1 Gbps, connected** |
 
-### What "Wi-Fi only" honestly is
+That last row is the point. Windows sees no Ethernet at all, but the NIC stays enabled and the
+link stays up. Switching back on restored the same IP address in **1 second**.
+
+It does this by detaching the adapter's TCP/IP binding, not by disabling the device — so nothing
+has to be re-enumerated, and the adapter cannot get stuck disabled.
+
+### The softer option
+
+There's a checkbox, *"Keep Ethernet's own network reachable"*. With it ticked, switching off only
+demotes Ethernet — the internet moves to Wi-Fi, but Ethernet keeps its address, so a NAS, printer
+or anything else on that wire still works. That's done by raising its routing metric rather than
+detaching anything.
+
+Off by default, because the default should mean what it says.
+
+### What "off" honestly is
 
 **It is zero IP. It is not zero traffic.** LinkSwitch removes TCP/IP and nothing else, and other
-protocols bind to that adapter directly. Reading the NIC's own upper-bind list on the machine
-this was built on:
+protocols bind to the adapter directly. Reading the NIC's own upper-bind list on the machine this
+was built on:
 
 ```
 lltdio  MsLldp  Ndisuio  RasPppoe  RDMANDK  rspndr  Tcpip  VMnetBridge
 ```
 
-Remove `Tcpip` and the rest still have a path to the copper. In practice that means:
+Remove `Tcpip` and the rest still have a path to the copper:
 
 - **LLDP** keeps advertising this machine to the switch.
-- **LLTD** (`rspndr`) still *answers* other Windows machines' network-map probes. It's explicitly
-  IP-independent, so your PC stays visible and mappable on that wired LAN.
-- **A VM bridge is the big one.** If VMware or Hyper-V bridging is bound to that NIC, a bridged
-  guest puts *its own* MAC and IP on the wire at layer 2, entirely beneath the host's stack —
-  so "zero Ethernet" would simply be false. LinkSwitch detects this and says so, in the widget
-  and in `--status`. It's bound on the development machine right now.
+- **LLTD** (`rspndr`) still *answers* other Windows machines' network-map probes. It is explicitly
+  IP-independent, so the PC stays visible on that wired LAN.
+- **A VM bridge is the big one.** If VMware or Hyper-V bridging is bound to the NIC, a bridged
+  guest puts *its own* MAC and IP on the wire at layer 2, beneath the host stack entirely — so
+  "zero Ethernet" would be false. LinkSwitch detects this and says so, in the widget and in
+  `--status`. It is bound on the development machine, and the screenshot above shows the warning.
 
-If you need literal zero frames, unplug the cable or disable the adapter — that's the honest
-answer, and it's why LinkSwitch doesn't claim otherwise.
+If you need literal zero frames, unplug the cable. That is the honest answer, and it is why
+LinkSwitch does not claim otherwise.
 
-One more thing not yet verified: whether the link itself stays up. Microsoft's own
-`Disable-NetAdapterBinding` documentation says the operation *"restarts the network adapter"*,
-which normally resets the PHY. Until that's measured against a managed switch, the only claim
-made here is that **the cable stays plugged in and the adapter stays enabled** — not that the
-switch port never blinks, and not that Wake-on-LAN survives.
+One thing measured but not fully characterised: the link **stayed up** through a switch off and
+back on (`Up, 1 Gbps, Connected` throughout), even though Microsoft's `Disable-NetAdapterBinding`
+documentation says the operation "restarts the network adapter". Whether it blips for a moment
+mid-operation has not been measured against a managed switch, so the claim made here is only that
+the cable stays plugged in and the adapter stays enabled.
 
 ## What it does *not* do
 
@@ -89,8 +106,12 @@ Stated plainly, because the alternative is you finding out later and assuming it
   moves with the switch. If they're on different subnets — a dock on a corporate LAN, say —
   longest-prefix match pins that LAN to Ethernet regardless of metric. That's usually what you
   want.
-- **"Wi-Fi only" silences the IP stack, not the wire.** See above. Nothing here makes an
+- **Switching off silences the IP stack, not the wire.** See above. Nothing here makes an
   Ethernet port electrically silent.
+- **Wi-Fi has to be available.** Switching Ethernet off connects Wi-Fi *first* and abandons the
+  whole operation if it cannot — so a mis-click cannot take the machine offline. If Windows had
+  already dropped Wi-Fi (it does that when a cable is plugged in; see above), LinkSwitch
+  reconnects it: the strongest network in range that you have saved, or the one you were last on.
 
 ## Install
 
@@ -109,7 +130,7 @@ further prompts.
 ```
 linkswitch                     the desktop widget
 linkswitch --status [--json]   what LinkSwitch sees; needs no admin rights
-linkswitch --apply MODE        ethernet | wifi | wifi-only | auto
+linkswitch --apply MODE        ethernet (on) | wifi-only (off) | wifi (soft off) | auto
 linkswitch --uninstall         restore everything and remove it
 ```
 

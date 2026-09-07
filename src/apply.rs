@@ -31,6 +31,29 @@ use crate::net::{binding, metric, wcm, wifi, LuidKey, Snapshot};
 /// usually 2-4 s; 15 s covers a slow 6 GHz roam without making a failure feel like a hang.
 const WIFI_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long to then wait for that association to become *usable*.
+///
+/// Associating and being able to carry traffic are different events, separated by a DHCP
+/// exchange. Checking for a default route the instant association completed failed for real:
+/// the worker reported "Wi-Fi is connected but has no default route yet" and refused the
+/// switch, and the route turned up a couple of seconds later.
+const ROUTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Wait until an interface actually has a default route, and return its total metric.
+fn wait_for_default_route(luid: LuidKey, timeout: Duration) -> Option<(Snapshot, u32)> {
+    let start = std::time::Instant::now();
+    loop {
+        let snap = Snapshot::read();
+        if let Some(total) = crate::net::routes::total_for(&snap.routes, luid) {
+            return Some((snap, total));
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
 /// Process exit codes. Distinct per failure class because `LastTaskResult` is the only channel
 /// the widget has when the worker dies before it can write a journal.
 pub mod exit {
@@ -194,6 +217,34 @@ pub fn apply(mode: Mode) -> ApplyReport {
 
     recover_if_torn();
 
+    // Reattach anything a previous "Wi-Fi only" detached, BEFORE anything else -- including
+    // before resolving adapters.
+    //
+    // Two reasons this has to come first. A metric written to an interface with no IP stack is
+    // a no-op, so the switch would appear to do nothing. And more importantly, this step must
+    // not depend on adapter enumeration at all: the journal records the adapter GUID, which is
+    // all the binding API needs, whereas enumeration can legitimately fail to see an adapter
+    // that currently has no IP stack. Doing it after resolution meant the app could detach
+    // Ethernet and then never put it back.
+    if mode != Mode::WifiOnly {
+        let previous = config::load_journal();
+        if !previous.bindings.is_empty() {
+            lslog!("reattaching the IP stack detached by a previous wifi-only");
+            if !restore_bindings(&previous.bindings) {
+                return ApplyReport::fail(
+                    mode,
+                    exit::BINDING_FAILED,
+                    "Could not reattach Ethernet's IP stack. Run `linkswitch --recover`.",
+                );
+            }
+            let mut j = previous;
+            j.bindings.clear();
+            let _ = config::save_journal(&j);
+            // DHCP needs a moment before the adapter is worth looking at again.
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+    }
+
     let cfg = config::load_machine();
     let snap = Snapshot::read();
     let targets = Targets::resolve(&cfg, &snap);
@@ -220,31 +271,26 @@ pub fn apply(mode: Mode) -> ApplyReport {
         wifi.if_index
     );
 
-    // Leaving "Wi-Fi only" must reattach the IP stack before anything else. Setting a metric on
-    // an interface that has no IP stack is a no-op, so without this the switch would appear to
-    // do nothing at all.
-    if mode != Mode::WifiOnly {
-        let previous = config::load_journal();
-        if !previous.bindings.is_empty() {
-            lslog!("reattaching the IP stack detached by a previous wifi-only");
-            if !restore_bindings(&previous.bindings) {
-                return ApplyReport::fail(
-                    mode,
-                    exit::BINDING_FAILED,
-                    "Could not reattach Ethernet's IP stack. Run `linkswitch --recover`.",
-                );
-            }
-            let mut j = previous;
-            j.bindings.clear();
-            let _ = config::save_journal(&j);
-        }
-    }
-
     match mode {
         Mode::Wifi => apply_wifi(&cfg, eth, wifi),
         Mode::WifiOnly => apply_wifi_only(&cfg, eth, wifi),
         Mode::Ethernet => apply_ethernet(&cfg, eth, wifi),
         Mode::Auto => apply_auto(eth, wifi),
+    }
+}
+
+/// Is Ethernet already beating Wi-Fi, so that parking Wi-Fi would be pointless?
+///
+/// Scoped to the two managed adapters on purpose. Deciding this from the global route winner
+/// was a real bug: with a VPN holding the default route the winner is always the tunnel, so
+/// Ethernet never appeared to win and Wi-Fi was pinned to 9000 on every switch to Ethernet.
+fn ethernet_is_ahead(eth_total: Option<u32>, wifi_total: Option<u32>) -> bool {
+    match (eth_total, wifi_total) {
+        (Some(e), Some(w)) => e < w,
+        // Wi-Fi has no default route at all, so there is nothing to lose to.
+        (Some(_), None) => true,
+        // Ethernet has no route yet; parking Wi-Fi would only remove the working link.
+        _ => true,
     }
 }
 
@@ -274,12 +320,11 @@ fn apply_wifi_only(cfg: &MachineConfig, eth: &Nic, wifi: &Nic) -> ApplyReport {
         }
     };
 
-    let snap = Snapshot::read();
-    if crate::net::routes::total_for(&snap.routes, wifi.luid).is_none() {
+    if wait_for_default_route(wifi.luid, ROUTE_TIMEOUT).is_none() {
         return ApplyReport::fail(
             mode,
             exit::WIFI_UNAVAILABLE,
-            "Wi-Fi is connected but has no default route yet. Try again in a moment.",
+            "Wi-Fi connected but never got a working address. Nothing was changed.",
         );
     }
 
@@ -395,18 +440,17 @@ fn apply_wifi(cfg: &MachineConfig, eth: &Nic, wifi: &Nic) -> ApplyReport {
     };
     lslog!("wifi pre-flight ok: connected to \"{profile}\"");
 
-    // Re-read: associating Wi-Fi changed the routing table.
-    let snap = Snapshot::read();
-    let wifi_total = crate::net::routes::total_for(&snap.routes, wifi.luid);
-    if wifi_total.is_none() {
+    // Associating is not the same as being usable: DHCP has to finish first.
+    let Some((_snap, wifi_total)) = wait_for_default_route(wifi.luid, ROUTE_TIMEOUT) else {
         return ApplyReport::fail(
             mode,
             exit::WIFI_UNAVAILABLE,
-            "Wi-Fi is connected but has no default route yet. Try again in a moment.",
+            "Wi-Fi connected but never got a working address. Nothing was changed.",
         );
-    }
+    };
+    lslog!("wifi usable: connected to \"{profile}\", total metric {wifi_total}");
 
-    let park = metric::park_value(cfg.park_metric, wifi_total);
+    let park = metric::park_value(cfg.park_metric, Some(wifi_total));
 
     // Journal BEFORE changing anything, so a kill between here and the end is recoverable.
     let backups = capture(eth.luid);
@@ -491,13 +535,20 @@ fn apply_ethernet(cfg: &MachineConfig, eth: &Nic, wifi: &Nic) -> ApplyReport {
         );
     }
 
-    // If Ethernet still does not win -- an unusual machine where its automatic metric is not
-    // lower -- park Wi-Fi instead of silently doing nothing.
+    // If Ethernet still does not beat Wi-Fi on automatic metrics -- an unusual machine where
+    // its automatic metric is not lower -- park Wi-Fi instead of silently doing nothing.
+    //
+    // The comparison is deliberately between the two managed adapters only, NOT the global
+    // route winner. Using the verdict here was a real bug: with a VPN holding the default
+    // route the verdict is always `Hijacked`, so Ethernet never "won" and Wi-Fi got pinned to
+    // 9000 on every single switch to Ethernet, even though Ethernet was already ahead.
     let after = Snapshot::read();
-    if !matches!(after.verdict(Some(eth.luid), Some(wifi.luid)), Verdict::Ethernet { .. }) {
-        if let Some(eth_total) = crate::net::routes::total_for(&after.routes, eth.luid) {
-            let park = metric::park_value(cfg.park_metric, Some(eth_total));
-            lslog!("ethernet did not win on automatic metrics; parking wi-fi at {park}");
+    let eth_total = crate::net::routes::total_for(&after.routes, eth.luid);
+    let wifi_total = crate::net::routes::total_for(&after.routes, wifi.luid);
+    if !ethernet_is_ahead(eth_total, wifi_total) {
+        if let Some(e) = eth_total {
+            let park = metric::park_value(cfg.park_metric, Some(e));
+            lslog!("ethernet did not beat wi-fi on automatic metrics; parking wi-fi at {park}");
             let _ = metric::steer(wifi.luid, Some(park));
         }
     }
@@ -663,6 +714,27 @@ mod tests {
         let r = ApplyReport::fail(Mode::Wifi, exit::WIFI_UNAVAILABLE, "nope");
         assert!(!r.ok);
         assert_ne!(r.exit_code, exit::OK);
+    }
+
+    #[test]
+    fn ethernet_ahead_ignores_a_vpn_holding_the_route() {
+        // The observed regression: Ethernet 25, Wi-Fi 35, ProtonVPN at 0. Ethernet is plainly
+        // ahead of Wi-Fi, and Wi-Fi must not be pinned.
+        assert!(ethernet_is_ahead(Some(25), Some(35)));
+        // The genuine case for parking: Ethernet's automatic metric loses to Wi-Fi's.
+        assert!(!ethernet_is_ahead(Some(45), Some(35)));
+        // A tie is not "ahead" -- ties between equal totals are unspecified in the stack.
+        assert!(!ethernet_is_ahead(Some(30), Some(30)));
+    }
+
+    #[test]
+    fn ethernet_ahead_never_parks_the_only_working_link() {
+        // Wi-Fi down: nothing to lose to.
+        assert!(ethernet_is_ahead(Some(25), None));
+        // Ethernet has no route (cable just in, DHCP pending): parking Wi-Fi would take away
+        // the one link that works.
+        assert!(ethernet_is_ahead(None, Some(35)));
+        assert!(ethernet_is_ahead(None, None));
     }
 
     #[test]

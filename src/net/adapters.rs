@@ -16,8 +16,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use windows::Win32::Foundation::NO_ERROR;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST,
-    GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
+    GetAdaptersAddresses, GetIfEntry2, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_INCLUDE_GATEWAYS,
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::{
     IfOperStatusUp, MediaConnectStateConnected, NdisPhysicalMedium802_3,
@@ -117,7 +118,14 @@ impl Nic {
 
 /// Enumerate every adapter, classified.
 pub fn enumerate() -> Vec<Nic> {
-    let flags = GAA_FLAG_INCLUDE_GATEWAYS
+    // GAA_FLAG_INCLUDE_ALL_INTERFACES is not optional here, it is what makes the "Wi-Fi only"
+    // mode reversible. By default GetAdaptersAddresses only returns adapters that have the
+    // requested address family bound, so the instant LinkSwitch detaches Ethernet's IP stack the
+    // adapter disappears from its own enumeration -- and with it, any ability to find that
+    // adapter again and put it back. Observed exactly that: detaching worked, and reattaching
+    // then failed with "no Ethernet adapter is available on this machine".
+    let flags = GAA_FLAG_INCLUDE_ALL_INTERFACES
+        | GAA_FLAG_INCLUDE_GATEWAYS
         | GAA_FLAG_SKIP_ANYCAST
         | GAA_FLAG_SKIP_MULTICAST
         | GAA_FLAG_SKIP_DNS_SERVER;

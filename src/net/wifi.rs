@@ -22,8 +22,9 @@ use windows::Win32::NetworkManagement::WiFi::{
     dot11_BSS_type_any, dot11_radio_state_off, wlan_connection_mode_profile,
     wlan_interface_state_connected, wlan_interface_state_not_ready,
     wlan_intf_opcode_current_connection,
-    wlan_intf_opcode_radio_state, WlanCloseHandle, WlanConnect, WlanEnumInterfaces, WlanFreeMemory,
-    WlanGetProfileList, WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES,
+    wlan_intf_opcode_radio_state, WlanCloseHandle, WlanConnect, WlanEnumInterfaces,
+    WlanFreeMemory, WlanGetAvailableNetworkList, WlanGetProfileList, WlanOpenHandle,
+    WlanQueryInterface, WLAN_AVAILABLE_NETWORK_LIST, WLAN_CONNECTION_ATTRIBUTES,
     WLAN_CONNECTION_PARAMETERS, WLAN_INTERFACE_INFO_LIST, WLAN_INTERFACE_STATE,
     WLAN_PROFILE_INFO_LIST, WLAN_RADIO_STATE,
 };
@@ -43,6 +44,8 @@ pub enum WifiError {
     RadioOff { hardware: bool },
     /// No saved Wi-Fi profile to connect to.
     NoProfile,
+    /// Networks are saved, but none of them is currently within range.
+    NoneInRange { saved: usize, visible: usize },
     /// `WlanConnect` was rejected outright.
     ConnectFailed { code: u32, profile: String },
     /// Association was requested but never completed.
@@ -71,6 +74,10 @@ impl WifiError {
                  can reconnect it for you."
                     .into()
             }
+            Self::NoneInRange { saved, visible } => format!(
+                "None of your {saved} saved Wi-Fi networks is in range ({visible} network(s) \
+                 visible). Move into range of one, or connect manually once."
+            ),
             Self::ConnectFailed { code, profile } => {
                 format!("Windows refused to connect to \"{profile}\" (error {code}).")
             }
@@ -275,6 +282,70 @@ fn profiles(h: &WlanHandle, guid: &GUID) -> Vec<String> {
     out
 }
 
+/// Profile names of networks that are both visible right now and connectable.
+///
+/// This is the half `WlanGetProfileList` cannot answer. Profile order is *preference* order,
+/// which says nothing about what is actually on the air -- on the development machine there are
+/// 31 saved profiles and the first is a phone hotspot that is almost never present. Connecting
+/// to `profiles[0]` therefore burned the whole association timeout and reported a useless
+/// "timed out" every time.
+fn available_profiles(h: &WlanHandle, guid: &GUID) -> Vec<(String, u32)> {
+    let mut list: *mut WLAN_AVAILABLE_NETWORK_LIST = std::ptr::null_mut();
+    // SAFETY: `list` is a valid out-pointer; ownership passes to WlanMem.
+    let rc = unsafe { WlanGetAvailableNetworkList(h.0, guid, 0, None, &mut list) };
+    if rc != 0 || list.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: non-null, from WlanGetAvailableNetworkList.
+    let list = unsafe { WlanMem::new(list) };
+    // SAFETY: allocation live for the lifetime of `list`.
+    let l = unsafe { list.get() };
+    let n = l.dwNumberOfItems as usize;
+    // SAFETY: flexible array member holding `dwNumberOfItems` entries.
+    let items = unsafe { std::slice::from_raw_parts(l.Network.as_ptr(), n) };
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for it in items {
+        if !it.bNetworkConnectable.as_bool() {
+            continue;
+        }
+        let name = utf16_to_string(&it.strProfileName);
+        // An empty profile name means a visible network we have no saved credentials for.
+        if name.is_empty() {
+            continue;
+        }
+        // The same SSID appears once per BSS; keep the strongest sighting.
+        match out.iter_mut().find(|(n, _)| *n == name) {
+            Some(e) => e.1 = e.1.max(it.wlanSignalQuality),
+            None => out.push((name, it.wlanSignalQuality)),
+        }
+    }
+    out
+}
+
+/// Choose which network to join.
+///
+/// The network we were last on wins if it is on the air. Otherwise the **strongest** saved
+/// network in range -- not the most preferred. Windows' preference order is whatever sequence
+/// the user happened to join things in over the years, so on a machine with 31 saved profiles
+/// it is a poor guess at "the network I am sitting next to"; signal strength is a much better
+/// one. Pure, so the rule is testable without a radio.
+fn choose_profile(
+    hint: Option<&str>,
+    saved: &[String],
+    visible: &[(String, u32)],
+) -> Option<String> {
+    if let Some(h) = hint {
+        if saved.iter().any(|s| s == h) && visible.iter().any(|(v, _)| v == h) {
+            return Some(h.to_string());
+        }
+    }
+    visible
+        .iter()
+        .filter(|(v, _)| saved.contains(v))
+        .max_by_key(|(_, q)| *q)
+        .map(|(v, _)| v.clone())
+}
+
 /// Ensure Wi-Fi is associated, connecting it if necessary.
 ///
 /// `preferred` is the profile last seen connected, tried first so a laptop with a dozen saved
@@ -311,10 +382,13 @@ pub fn ensure_connected(
     if saved.is_empty() {
         return Err(WifiError::NoProfile);
     }
-    let profile = preferred
-        .filter(|p| saved.iter().any(|s| s == p))
-        .map(str::to_owned)
-        .unwrap_or_else(|| saved[0].clone());
+    let visible = available_profiles(&h, &guid);
+    let Some(profile) = choose_profile(preferred, &saved, &visible) else {
+        return Err(WifiError::NoneInRange {
+            saved: saved.len(),
+            visible: visible.len(),
+        });
+    };
 
     // A profile connection, not `wlan_connection_mode_auto`: auto mode is documented as valid
     // only for WlanConnect's "auto" discovery variants and is rejected with
@@ -372,6 +446,85 @@ mod tests {
     }
 
     #[test]
+    fn choose_profile_requires_the_network_to_be_in_range() {
+        // The real failure this fixes: 31 saved networks, the first one a phone hotspot that is
+        // not broadcasting. Preference order alone picks it and the association times out.
+        let saved: Vec<String> = ["MyPhone", "OtherNet", "HomeNet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let visible = vec![("HomeNet".to_string(), 80)];
+        assert_eq!(
+            choose_profile(None, &saved, &visible).as_deref(),
+            Some("HomeNet")
+        );
+    }
+
+    #[test]
+    fn choose_profile_takes_the_strongest_in_range_not_the_most_preferred() {
+        // Observed for real: preference order picked OtherNet over the network the machine
+        // actually sits next to, purely because it was joined earlier.
+        let saved: Vec<String> = ["OtherNet", "HomeNet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let visible = vec![
+            ("OtherNet".to_string(), 42),
+            ("HomeNet".to_string(), 88),
+        ];
+        assert_eq!(
+            choose_profile(None, &saved, &visible).as_deref(),
+            Some("HomeNet")
+        );
+    }
+
+    #[test]
+    fn choose_profile_ignores_strong_networks_we_have_no_profile_for() {
+        let saved = vec!["Home".to_string()];
+        let visible = vec![("Neighbour".to_string(), 99), ("Home".to_string(), 30)];
+        assert_eq!(choose_profile(None, &saved, &visible).as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn choose_profile_prefers_the_hint_when_it_is_in_range() {
+        let saved: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let visible = vec![("A".to_string(), 90), ("B".to_string(), 20)];
+        // The hint wins even though A is far stronger: stability beats churn.
+        assert_eq!(choose_profile(Some("B"), &saved, &visible).as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn choose_profile_ignores_a_hint_that_is_out_of_range() {
+        // Coming home with a saved office network as the hint must not strand the switch.
+        let saved: Vec<String> = ["Office", "Home"].iter().map(|s| s.to_string()).collect();
+        let visible = vec![("Home".to_string(), 70)];
+        assert_eq!(
+            choose_profile(Some("Office"), &saved, &visible).as_deref(),
+            Some("Home")
+        );
+    }
+
+    #[test]
+    fn choose_profile_ignores_a_hint_we_have_no_profile_for() {
+        let saved = vec!["Home".to_string()];
+        let visible = vec![("Home".to_string(), 70), ("Neighbour".to_string(), 90)];
+        assert_eq!(
+            choose_profile(Some("Neighbour"), &saved, &visible).as_deref(),
+            Some("Home")
+        );
+    }
+
+    #[test]
+    fn choose_profile_gives_up_when_nothing_saved_is_in_range() {
+        let saved: Vec<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let visible = vec![("SomeoneElse".to_string(), 90)];
+        assert_eq!(choose_profile(None, &saved, &visible), None);
+        assert_eq!(choose_profile(Some("A"), &saved, &visible), None);
+        // And with the radio seeing nothing at all.
+        assert_eq!(choose_profile(None, &saved, &[]), None);
+    }
+
+    #[test]
     fn every_error_has_a_distinct_actionable_message() {
         let errs = [
             WifiError::ServiceUnavailable(5),
@@ -380,6 +533,10 @@ mod tests {
             WifiError::RadioOff { hardware: true },
             WifiError::RadioOff { hardware: false },
             WifiError::NoProfile,
+            WifiError::NoneInRange {
+                saved: 31,
+                visible: 4,
+            },
             WifiError::ConnectFailed {
                 code: 1168,
                 profile: "HomeNet".into(),
