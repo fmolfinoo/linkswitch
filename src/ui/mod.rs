@@ -115,13 +115,14 @@ pub struct App {
     sender: Sender<ApplyResult>,
     notify: Option<net::notify::Handles>,
     tray: Option<tray::Tray>,
+    instance: crate::single_instance::InstanceGuard,
     visible: bool,
     hwnd_done: bool,
     logged_metrics: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, instance: crate::single_instance::InstanceGuard) -> Self {
         let cfg = config::load_machine();
         let prefs = config::load_prefs();
         let view = View::read(&cfg);
@@ -156,6 +157,7 @@ impl App {
             sender,
             notify,
             tray,
+            instance,
             visible: true,
             hwnd_done: false,
             logged_metrics: false,
@@ -258,6 +260,15 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.pump(ctx);
         self.pump_tray(ctx);
+        // A second launch (Start menu, shortcut, double-click) signals this rather than starting
+        // its own copy. eframe keeps ticking `logic` while the window is hidden, which is exactly
+        // the case that matters here.
+        if self.instance.show_requested() && !self.visible {
+            self.visible = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            net::notify::mark_stale();
+        }
         if !self.hwnd_done {
             self.hwnd_done = true;
             crate::ui::widget::polish_window(frame);
@@ -297,7 +308,7 @@ impl eframe::App for App {
     }
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(instance: crate::single_instance::InstanceGuard) -> Result<(), String> {
     let prefs = config::load_prefs();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -325,7 +336,7 @@ pub fn run() -> Result<(), String> {
     eframe::run_native(
         "LinkSwitch",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, instance)))),
     )
     .map_err(|e| format!("cannot open the widget: {e}"))
 }

@@ -522,7 +522,7 @@ mod tests {
             "not-a-guid",
             "{66666666-7777-8888-9999}",
             "{66666666-7777-8888-9999-AAAAAAAAAAAA-extra}",
-            "{ZZZZDBD0-7777-8888-9999-AAAAAAAAAAAA}",
+            "{ZZZZ6666-7777-8888-9999-AAAAAAAAAAAA}",
             "{66666666-7777-8888-9999-AAAAAAAAAAA}",
         ] {
             assert!(parse_guid(bad).is_none(), "{bad} should not parse");

@@ -11,6 +11,7 @@ mod elevate;
 mod install;
 mod log;
 mod net;
+mod single_instance;
 mod tasks;
 mod ui;
 
@@ -34,7 +35,13 @@ fn main() -> ExitCode {
     match cmd {
         Cmd::Gui => {
             log::init(config::widget_log_path(), "widget");
-            match ui::run() {
+            // One widget per session. A second launch asks the running one to show itself and
+            // then exits, rather than adding a second identical tray icon.
+            let Some(instance) = single_instance::acquire() else {
+                log::line("another instance is already running; asked it to show and exiting");
+                return ExitCode::SUCCESS;
+            };
+            match ui::run(instance) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("linkswitch: {e}");
