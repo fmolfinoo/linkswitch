@@ -3,3 +3,6 @@
 *.pdb
 .vscode/
 .idea/
+
+# Raw multi-agent research payloads; the distilled blueprint and critique are kept.
+docs/research/*-dives.json
