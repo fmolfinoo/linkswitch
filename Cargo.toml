@@ -1,0 +1,60 @@
+[package]
+name = "linkswitch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+build = "build.rs"
+description = "Switch Windows internet traffic between Ethernet and Wi-Fi without unplugging the cable."
+repository = "https://github.com/fmolfinoo/linkswitch"
+readme = "README.md"
+keywords = ["windows", "networking", "ethernet", "wifi", "widget"]
+categories = ["gui"]
+
+[[bin]]
+name = "linkswitch"
+path = "src/main.rs"
+
+[dependencies]
+# glow rather than eframe's default wgpu: ~96 crates / ~6 MB release instead of ~167 / ~14 MB.
+# Both were verified to build and open a borderless transparent always-on-top window.
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.36.1"
+tray-icon = "0.24"
+raw-window-handle = "0.6.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_NetworkManagement_WiFi",
+  "Win32_NetworkManagement_WindowsConnectionManager",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Com",
+  "Win32_System_Console",
+  "Win32_System_Registry",
+  "Win32_System_TaskScheduler",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-manifest = "1.5"
+embed-resource = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# NOTE: deliberately NOT `panic = "abort"`. The elevated worker runs with no console under
+# Task Scheduler, so its only diagnostics channel is the log file; aborting would produce a
+# 0xC0000409 exit with zero log lines exactly when something went wrong. See docs G11.
