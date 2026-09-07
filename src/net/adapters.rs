@@ -79,7 +79,12 @@ pub struct Nic {
     /// you only watch the routing table.
     pub media_connected: bool,
     pub tx_speed_bps: Option<u64>,
+    /// Current MAC. Display only -- Wi-Fi "random hardware addresses" makes it drift.
     pub mac: Option<[u8; 6]>,
+    /// Burned-in MAC from `MIB_IF_ROW2::PermanentPhysicalAddress`. This is the durable
+    /// identity: it survives reboots, driver reinstalls, dock reconnects and MAC
+    /// randomisation, none of which the LUID or the current MAC do.
+    pub permanent_mac: Option<[u8; 6]>,
     pub ipv4: Vec<Ipv4Addr>,
     pub ipv6: Vec<Ipv6Addr>,
     pub gateways: Vec<IpAddr>,
@@ -213,13 +218,14 @@ unsafe fn walk(head: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Nic> {
         };
 
         let detail = if_detail(luid);
-        let (kind, tier, media_connected, tx_speed_bps, oper_up) = match detail {
+        let (kind, tier, media_connected, tx_speed_bps, oper_up, permanent_mac) = match detail {
             Some(d) => (
                 d.kind,
                 classify_tier(&d, routable),
                 d.media_connected,
                 d.tx_speed_bps,
                 d.oper_up,
+                d.permanent_mac,
             ),
             None => (
                 kind_from_if_type(if_type),
@@ -227,6 +233,7 @@ unsafe fn walk(head: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Nic> {
                 false,
                 None,
                 a.OperStatus == IfOperStatusUp,
+                None,
             ),
         };
 
@@ -243,6 +250,7 @@ unsafe fn walk(head: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Nic> {
             media_connected,
             tx_speed_bps,
             mac,
+            permanent_mac,
             ipv4,
             ipv6,
             gateways,
@@ -260,6 +268,7 @@ struct IfDetail {
     media_connected: bool,
     oper_up: bool,
     tx_speed_bps: Option<u64>,
+    permanent_mac: Option<[u8; 6]>,
 }
 
 fn if_detail(luid: LuidKey) -> Option<IfDetail> {
@@ -286,8 +295,15 @@ fn if_detail(luid: LuidKey) -> Option<IfDetail> {
         _ => kind_from_if_type(row.Type),
     };
 
+    let permanent_mac = (row.PhysicalAddressLength == 6).then(|| {
+        let mut m = [0u8; 6];
+        m.copy_from_slice(&row.PermanentPhysicalAddress[..6]);
+        m
+    });
+
     Some(IfDetail {
         kind,
+        permanent_mac,
         hardware: f & FLAG_HARDWARE_INTERFACE != 0,
         connector_present: f & FLAG_CONNECTOR_PRESENT != 0,
         filter_interface: f & FLAG_FILTER_INTERFACE != 0,
@@ -447,6 +463,7 @@ mod tests {
             media_connected: true,
             oper_up: true,
             tx_speed_bps: Some(1_000_000_000),
+            permanent_mac: None,
         }
     }
 
@@ -566,6 +583,7 @@ mod tests {
             media_connected: live,
             tx_speed_bps: Some(speed),
             mac: None,
+            permanent_mac: None,
             ipv4: if live { vec![Ipv4Addr::new(192, 168, 1, 2)] } else { vec![] },
             ipv6: vec![],
             gateways: if gw { vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))] } else { vec![] },

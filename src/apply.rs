@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::config::{self, MachineConfig, MetricBackup, Mode};
 use crate::lslog;
-use crate::net::adapters::Nic;
+use crate::net::adapters::{Nic, NicKind};
 use crate::net::routes::Verdict;
 use crate::net::{metric, wcm, wifi, LuidKey, Snapshot};
 
@@ -77,10 +77,10 @@ impl Targets {
         // Fall back to the best auto-detected candidate when nothing is configured yet, so a
         // fresh install works before the user has visited any settings.
         let (eth_c, wifi_c) = snap.candidates();
-        let eth = config::resolve(cfg.ethernet.as_ref(), &snap.nics)
+        let eth = config::resolve(cfg.ethernet.as_ref(), NicKind::Ethernet, &snap.nics)
             .or_else(|| eth_c.first().copied())
             .cloned();
-        let wifi = config::resolve(cfg.wifi.as_ref(), &snap.nics)
+        let wifi = config::resolve(cfg.wifi.as_ref(), NicKind::Wifi, &snap.nics)
             .or_else(|| wifi_c.first().copied())
             .cloned();
         Self { eth, wifi }

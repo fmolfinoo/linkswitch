@@ -174,8 +174,8 @@ fn print_status(json: bool) {
     let journal = config::load_journal();
     let (eth_c, wifi_c) = snap.candidates();
 
-    let eth = config::resolve(cfg.ethernet.as_ref(), &snap.nics).or_else(|| eth_c.first().copied());
-    let wifi = config::resolve(cfg.wifi.as_ref(), &snap.nics).or_else(|| wifi_c.first().copied());
+    let eth = config::resolve(cfg.ethernet.as_ref(), net::adapters::NicKind::Ethernet, &snap.nics).or_else(|| eth_c.first().copied());
+    let wifi = config::resolve(cfg.wifi.as_ref(), net::adapters::NicKind::Wifi, &snap.nics).or_else(|| wifi_c.first().copied());
     let verdict = snap.verdict(eth.map(|n| n.luid), wifi.map(|n| n.luid));
     let wifi_status = net::wifi::status();
     let policy = net::wcm::effective();
@@ -188,10 +188,13 @@ fn print_status(json: bool) {
         let esc = |s: &str| s.replace('\\', r"\\").replace('"', "\\\"");
         let nic_json = |n: Option<&net::adapters::Nic>| match n {
             Some(n) => format!(
-                r#"{{"name":"{}","if_index":{},"luid":"{}","up":{},"media_connected":{},"ipv4":{:?}}}"#,
+                r#"{{"name":"{}","if_index":{},"luid":"{}","permanent_mac":{},"up":{},"media_connected":{},"ipv4":{:?}}}"#,
                 esc(n.label()),
                 n.if_index,
                 n.luid,
+                n.permanent_mac
+                    .map(|m| format!("\"{}\"", config::format_mac(m)))
+                    .unwrap_or_else(|| "null".into()),
                 n.oper_up,
                 n.media_connected,
                 n.ipv4.iter().map(|a| a.to_string()).collect::<Vec<_>>()

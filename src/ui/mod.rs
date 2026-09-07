@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, MachineConfig, Mode, UserPrefs};
 use crate::install;
-use crate::net::{self, adapters::Nic, routes::Verdict, wcm, wifi::WifiStatus, Snapshot};
+use crate::net::{self, adapters, adapters::Nic, routes::Verdict, wcm, wifi::WifiStatus, Snapshot};
 
 /// Result of a switch, delivered from the worker thread back to the UI.
 pub struct ApplyResult {
@@ -32,10 +32,10 @@ impl View {
     fn read(cfg: &MachineConfig) -> Self {
         let snap = Snapshot::read();
         let (eth_c, wifi_c) = snap.candidates();
-        let eth = config::resolve(cfg.ethernet.as_ref(), &snap.nics)
+        let eth = config::resolve(cfg.ethernet.as_ref(), adapters::NicKind::Ethernet, &snap.nics)
             .or_else(|| eth_c.first().copied())
             .cloned();
-        let wifi = config::resolve(cfg.wifi.as_ref(), &snap.nics)
+        let wifi = config::resolve(cfg.wifi.as_ref(), adapters::NicKind::Wifi, &snap.nics)
             .or_else(|| wifi_c.first().copied())
             .cloned();
         let verdict = snap.verdict(eth.as_ref().map(|n| n.luid), wifi.as_ref().map(|n| n.luid));
