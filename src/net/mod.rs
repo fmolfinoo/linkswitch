@@ -9,6 +9,8 @@ pub mod err;
 pub mod luid;
 pub mod metric;
 pub mod routes;
+pub mod wcm;
+pub mod wifi;
 
 pub use luid::LuidKey;
 

@@ -1,3 +1,6 @@
+mod config;
+mod elevate;
+mod log;
 mod net;
 
 fn main() {
@@ -42,4 +45,5 @@ fn main() {
     let e = eth.first().map(|n| n.luid);
     let w = wifi.first().map(|n| n.luid);
     println!("== verdict == {:?}", snap.verdict(e, w));
+    println!("== wifi == {:?}", net::wifi::status());
 }
