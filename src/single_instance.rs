@@ -62,10 +62,22 @@ impl Drop for InstanceGuard {
 /// `Some` means we are the only instance. `None` means another one is already running and has
 /// been asked to show itself; the caller should exit quietly.
 pub fn acquire() -> Option<InstanceGuard> {
+    acquire_named(MUTEX_NAME, EVENT_NAME)
+}
+
+/// The real work, with the object names injected.
+///
+/// Parameterised purely so the tests can use their own names. Sharing the app's names would make
+/// the test fail whenever the widget happens to be running, and -- far worse -- a test run would
+/// signal the live widget to unhide itself.
+fn acquire_named(
+    mutex_name: windows::core::PCWSTR,
+    event_name: windows::core::PCWSTR,
+) -> Option<InstanceGuard> {
     // SAFETY: creating named kernel objects; every handle is either stored in the guard or
     // closed before returning.
     unsafe {
-        let Ok(mutex) = CreateMutexW(None, true, MUTEX_NAME) else {
+        let Ok(mutex) = CreateMutexW(None, true, mutex_name) else {
             // Without the mutex we cannot arbitrate, so run rather than refuse to start at all.
             return Some(InstanceGuard {
                 mutex: HANDLE::default(),
@@ -77,25 +89,25 @@ pub fn acquire() -> Option<InstanceGuard> {
         // error is the only way to tell whether we are the owner.
         if windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(mutex);
-            signal_show();
+            signal_show(event_name);
             return None;
         }
 
         // Auto-reset: waking the first instance consumes the request, so one extra launch does
         // not leave the window permanently pinned open.
-        let event = CreateEventW(None, false, false, EVENT_NAME).unwrap_or_default();
+        let event = CreateEventW(None, false, false, event_name).unwrap_or_default();
         Some(InstanceGuard { mutex, event })
     }
 }
 
 /// Ask the already-running instance to show its window.
-fn signal_show() {
+fn signal_show(event_name: windows::core::PCWSTR) {
     // SAFETY: opening an existing named event by name; the handle is closed on every path.
     unsafe {
         if let Ok(h) = OpenEventW(
             SYNCHRONIZATION_ACCESS_RIGHTS(EVENT_MODIFY_STATE.0),
             false,
-            EVENT_NAME,
+            event_name,
         ) {
             let _ = SetEvent(h);
             let _ = CloseHandle(h);
@@ -107,12 +119,18 @@ fn signal_show() {
 mod tests {
     use super::*;
 
+    // Deliberately not the app's names: otherwise this test fails whenever the widget is
+    // running, and signals the live widget to unhide as a side effect.
+    const TEST_MUTEX: windows::core::PCWSTR = w!(r"Local\LinkSwitch.Test.SingleInstance");
+    const TEST_EVENT: windows::core::PCWSTR = w!(r"Local\LinkSwitch.Test.ShowWindow");
+
     #[test]
     fn the_first_acquire_wins_and_the_second_is_refused() {
-        let first = acquire().expect("first instance should own the session");
+        let first =
+            acquire_named(TEST_MUTEX, TEST_EVENT).expect("first instance should own the session");
         // A second attempt in-process takes the same path a second launch would.
         assert!(
-            acquire().is_none(),
+            acquire_named(TEST_MUTEX, TEST_EVENT).is_none(),
             "a second instance must not be allowed to run"
         );
         // ...and it should have left a show request behind for the owner to pick up.
@@ -125,7 +143,7 @@ mod tests {
         drop(first);
 
         // Once the owner exits, the session is claimable again.
-        let again = acquire();
+        let again = acquire_named(TEST_MUTEX, TEST_EVENT);
         assert!(again.is_some(), "the guard must be released on drop");
     }
 }
