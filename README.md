@@ -25,9 +25,52 @@ LinkSwitch handles both. It raises the losing interface's metric so the other on
 associates Wi-Fi itself before switching, which the policy permits because manually-connected
 networks are on its keep-list.
 
-Nothing is disabled. The cable stays plugged in, the NIC stays enabled, the link stays up, and
-Ethernet keeps serving its own subnet — so a NAS, printer, or anything else on the wire keeps
-working even while your internet goes over Wi-Fi.
+Nothing is disabled and the cable never comes out.
+
+## The three modes
+
+| Mode | Internet goes over | Ethernet's own subnet | Ethernet's IP stack |
+|---|---|---|---|
+| **Ethernet** | the cable | works | attached |
+| **Wi-Fi** | Wi-Fi | still works — NAS, printer, whatever | attached |
+| **Wi-Fi only** | Wi-Fi | gone | **detached** |
+
+**Wi-Fi** is the everyday one. Ethernet stays enabled and addressed, so anything on the wire
+keeps working; only your *internet* moves.
+
+**Wi-Fi only** is for when you want Ethernet to contribute nothing at all. Its IP stack is
+detached outright: no address, no routes of any kind, no DNS servers, no DHCP, and it disappears
+from the Windows network list. NetBIOS and SMB go with it. The cable stays plugged in and the
+adapter stays enabled the whole time.
+
+### What "Wi-Fi only" honestly is
+
+**It is zero IP. It is not zero traffic.** LinkSwitch removes TCP/IP and nothing else, and other
+protocols bind to that adapter directly. Reading the NIC's own upper-bind list on the machine
+this was built on:
+
+```
+lltdio  MsLldp  Ndisuio  RasPppoe  RDMANDK  rspndr  Tcpip  VMnetBridge
+```
+
+Remove `Tcpip` and the rest still have a path to the copper. In practice that means:
+
+- **LLDP** keeps advertising this machine to the switch.
+- **LLTD** (`rspndr`) still *answers* other Windows machines' network-map probes. It's explicitly
+  IP-independent, so your PC stays visible and mappable on that wired LAN.
+- **A VM bridge is the big one.** If VMware or Hyper-V bridging is bound to that NIC, a bridged
+  guest puts *its own* MAC and IP on the wire at layer 2, entirely beneath the host's stack —
+  so "zero Ethernet" would simply be false. LinkSwitch detects this and says so, in the widget
+  and in `--status`. It's bound on the development machine right now.
+
+If you need literal zero frames, unplug the cable or disable the adapter — that's the honest
+answer, and it's why LinkSwitch doesn't claim otherwise.
+
+One more thing not yet verified: whether the link itself stays up. Microsoft's own
+`Disable-NetAdapterBinding` documentation says the operation *"restarts the network adapter"*,
+which normally resets the PHY. Until that's measured against a managed switch, the only claim
+made here is that **the cable stays plugged in and the adapter stays enabled** — not that the
+switch port never blinks, and not that Wake-on-LAN survives.
 
 ## What it does *not* do
 
@@ -46,6 +89,8 @@ Stated plainly, because the alternative is you finding out later and assuming it
   moves with the switch. If they're on different subnets — a dock on a corporate LAN, say —
   longest-prefix match pins that LAN to Ethernet regardless of metric. That's usually what you
   want.
+- **"Wi-Fi only" silences the IP stack, not the wire.** See above. Nothing here makes an
+  Ethernet port electrically silent.
 
 ## Install
 
@@ -64,7 +109,7 @@ further prompts.
 ```
 linkswitch                     the desktop widget
 linkswitch --status [--json]   what LinkSwitch sees; needs no admin rights
-linkswitch --apply MODE        ethernet | wifi | auto
+linkswitch --apply MODE        ethernet | wifi | wifi-only | auto
 linkswitch --uninstall         restore everything and remove it
 ```
 
@@ -123,7 +168,14 @@ built around avoiding it:
   touched. If the worker is killed halfway, the next run notices and puts it back. There's a logon
   task that does this automatically.
 - **Restore means the exact prior value**, never a guessed default. If you had manually pinned
-  Ethernet to metric 10, you get 10 back — not "automatic".
+  Ethernet to metric 10, you get 10 back — not "automatic". The same rule governs protocol
+  bindings, and there it matters more: LinkSwitch **never enables a binding it did not itself
+  disable**. On the development machine a VPN had already unbound IPv6 for leak protection, and
+  a restore that "helpfully" reset things to Windows defaults would have switched IPv6 back on
+  and leaked the user's real address — worse than the problem it was fixing.
+- **Leaving "Wi-Fi only" reattaches the IP stack first**, before any metric is touched. Setting
+  a metric on an interface with no IP stack is a no-op, so without that ordering the switch back
+  would silently appear to do nothing.
 - **The switch is verified,** and reverted if it left the machine with no route at all.
 - **LinkSwitch only ever touches the two adapters it manages**, and only their metrics.
 
@@ -143,6 +195,16 @@ Get-NetIPInterface |
         Write-Host "restoring $($_.InterfaceAlias) ($($_.AddressFamily))"
         Set-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily $_.AddressFamily -AutomaticMetric Enabled
     }
+
+# Reattach the IP stack on any physical adapter that has lost IPv4.
+# Only IPv4: re-enabling IPv6 blindly would undo a VPN's leak protection.
+Get-NetAdapter -Physical | ForEach-Object {
+    $b = Get-NetAdapterBinding -Name $_.Name -ComponentID ms_tcpip -ErrorAction SilentlyContinue
+    if ($b -and -not $b.Enabled) {
+        Write-Host "reattaching IPv4 on $($_.Name)"
+        Enable-NetAdapterBinding -Name $_.Name -ComponentID ms_tcpip
+    }
+}
 
 # Remove LinkSwitch's scheduled tasks.
 Get-ScheduledTask -TaskPath '\LinkSwitch\' -ErrorAction SilentlyContinue |
@@ -186,7 +248,7 @@ the icon is generated by a committed script (`python assets/make_icon.py`) and t
 checked in, so Python isn't needed to build.
 
 ```powershell
-cargo test    # 89 tests, no hardware or admin rights required
+cargo test    # 98 tests, no hardware or admin rights required
 ```
 
 ## How it's built
@@ -195,6 +257,7 @@ cargo test    # 89 tests, no hardware or admin rights required
 |---|---|
 | `net/adapters.rs` | Enumerate adapters and work out which are real |
 | `net/metric.rs` | Read, pin and restore interface metrics |
+| `net/binding.rs` | Detach and reattach an adapter's IP stack (INetCfg COM) |
 | `net/routes.rs` | Decide which interface is actually carrying traffic |
 | `net/wifi.rs` | Wi-Fi status, and associating on demand |
 | `net/wcm.rs` | The Windows connection-manager policy |

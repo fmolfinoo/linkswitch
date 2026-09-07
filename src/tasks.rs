@@ -52,6 +52,12 @@ pub const ALL_TASKS: &[TaskSpec] = &[
         logon_trigger: false,
     },
     TaskSpec {
+        name: "ApplyWifiOnly",
+        args: "--apply wifi-only",
+        description: "LinkSwitch: detach Ethernet's IP stack so only Wi-Fi carries traffic. The                       cable stays plugged in and the adapter stays enabled.",
+        logon_trigger: false,
+    },
+    TaskSpec {
         name: "ApplyAuto",
         args: "--apply auto",
         description: "LinkSwitch: hand both adapters back to Windows' automatic metrics.",
@@ -477,7 +483,7 @@ mod tests {
 
     #[test]
     fn every_mode_maps_to_a_registered_task() {
-        for mode in [Mode::Ethernet, Mode::Wifi, Mode::Auto] {
+        for mode in [Mode::Ethernet, Mode::Wifi, Mode::WifiOnly, Mode::Auto] {
             assert!(
                 ALL_TASKS.iter().any(|t| t.name == mode.task_name()),
                 "{} has no task",

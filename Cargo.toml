@@ -34,6 +34,7 @@ features = [
   "Win32_Networking_WinSock",
   "Win32_NetworkManagement_WiFi",
   "Win32_NetworkManagement_WindowsConnectionManager",
+  "Win32_NetworkManagement_NetManagement",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_Com",

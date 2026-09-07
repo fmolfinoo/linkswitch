@@ -183,7 +183,11 @@ fn state_text(nic: Option<&Nic>, kind: NicKind, view: &View) -> String {
     };
     match kind {
         NicKind::Ethernet => {
-            if !n.media_connected {
+            if view.eth_ip_detached {
+                // Distinct from "cable unplugged" on purpose: both leave the adapter with no
+                // routes, and conflating them would hide the whole point of this mode.
+                "IP stack detached".into()
+            } else if !n.media_connected {
                 "cable unplugged".into()
             } else if !n.oper_up {
                 "down".into()
@@ -231,34 +235,34 @@ fn buttons(app: &mut App, ui: &mut Ui) {
         .as_ref()
         .map(|n| !n.media_connected)
         .unwrap_or(true);
+    let eth_detached = app.view.eth_ip_detached;
+
+    // Two rows of two rather than four across: at 330 px, four buttons leave no room for
+    // "Wi-Fi only" to be readable, and truncating the one mode that needs explaining is the
+    // wrong trade.
+    let w = (ui.available_width() - 8.0) / 2.0;
+
+    let mut button = |ui: &mut Ui, mode: Mode, text: &str, on: bool, enabled: bool, tip: &str| {
+        let fill = if on { theme::BTN_ON } else { theme::BTN };
+        let resp = ui.add_enabled(
+            enabled && !busy,
+            egui::Button::new(RichText::new(text).color(theme::TEXT).size(12.0))
+                .fill(fill)
+                .min_size(egui::vec2(w, 26.0))
+                .corner_radius(7.0),
+        );
+        let resp = resp.on_disabled_hover_text(tip.to_string());
+        if resp.on_hover_text(tip.to_string()).clicked() {
+            app.request(mode);
+        }
+    };
 
     ui.horizontal(|ui| {
-        let w = (ui.available_width() - 16.0) / 3.0;
-
-        let mut button = |ui: &mut Ui, mode: Mode, text: &str, enabled: bool, tip: &str| {
-            let on = active == Some(mode);
-            let fill = if on { theme::BTN_ON } else { theme::BTN };
-            let resp = ui.add_enabled(
-                enabled && !busy,
-                egui::Button::new(RichText::new(text).color(theme::TEXT).size(12.0))
-                    .fill(fill)
-                    .min_size(egui::vec2(w, 26.0))
-                    .corner_radius(7.0),
-            );
-            let resp = if tip.is_empty() {
-                resp
-            } else {
-                resp.on_disabled_hover_text(tip).on_hover_text(tip)
-            };
-            if resp.clicked() {
-                app.request(mode);
-            }
-        };
-
         button(
             ui,
             Mode::Ethernet,
             "Ethernet",
+            active == Some(Mode::Ethernet) && !eth_detached,
             !eth_unplugged,
             if eth_unplugged {
                 "The Ethernet cable is not connected."
@@ -270,14 +274,36 @@ fn buttons(app: &mut App, ui: &mut Ui) {
             ui,
             Mode::Wifi,
             "Wi-Fi",
+            active == Some(Mode::Wifi) && !eth_detached,
             !policy_blocks_wifi,
             if policy_blocks_wifi {
                 "Group Policy prevents Wi-Fi while Ethernet is connected."
             } else {
-                "Send traffic over Wi-Fi. Ethernet stays connected."
+                "Send traffic over Wi-Fi. Ethernet stays connected and keeps its own subnet."
             },
         );
-        button(ui, Mode::Auto, "Auto", true, "Let Windows decide again.");
+    });
+    ui.horizontal(|ui| {
+        button(
+            ui,
+            Mode::WifiOnly,
+            "Wi-Fi only",
+            eth_detached,
+            !policy_blocks_wifi,
+            if policy_blocks_wifi {
+                "Group Policy prevents Wi-Fi while Ethernet is connected."
+            } else {
+                "Detach Ethernet's IP stack entirely: no address, no routes, no DNS. The cable                  stays plugged in and the adapter stays enabled."
+            },
+        );
+        button(
+            ui,
+            Mode::Auto,
+            "Auto",
+            active == Some(Mode::Auto),
+            true,
+            "Let Windows decide again.",
+        );
     });
 }
 
@@ -321,6 +347,19 @@ fn banner_text(app: &App) -> (String, Color32) {
             theme::DANGER,
         );
     }
+    if app.view.eth_ip_detached {
+        // Never let this mode read as "the wire is silent". It is not.
+        return match &app.view.bridge_note {
+            Some(note) => (
+                format!("Ethernet has no IP stack. {note}"),
+                theme::WARN,
+            ),
+            None => (
+                "Ethernet has no IP stack. Discovery protocols still reach the wire.".into(),
+                theme::MUTED,
+            ),
+        };
+    }
     if matches!(app.view.verdict, Verdict::None) {
         return ("No network route right now.".into(), theme::DANGER);
     }
@@ -339,7 +378,9 @@ pub fn polish_window(frame: &eframe::Frame) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_APPWINDOW,
+        WS_EX_TOOLWINDOW,
     };
 
     let Ok(handle) = frame.window_handle() else {
@@ -355,6 +396,20 @@ pub fn polish_window(frame: &eframe::Frame) {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let next = (ex | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+
+        // Mandatory follow-up. A GWL_EXSTYLE change is not committed until a SetWindowPos with
+        // SWP_FRAMECHANGED, and without it the window also silently loses its topmost Z-order --
+        // observed directly: the widget carried on running, tray and all, quietly behind the
+        // editor. HWND_TOPMOST re-asserts what the ViewportBuilder asked for.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
 }
 

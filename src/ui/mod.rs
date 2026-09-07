@@ -26,6 +26,15 @@ pub struct View {
     pub wifi_status: Option<WifiStatus>,
     pub policy: wcm::PolicyState,
     pub installed: bool,
+    /// Ethernet's IP stack is detached -- the "Wi-Fi only" mode is in effect.
+    pub eth_ip_detached: bool,
+    /// Set when silencing Ethernet's IP stack would still leave frames on the wire.
+    pub bridge_note: Option<String>,
+    /// The mode LinkSwitch last applied, from the journal. This is what the user *asked for*,
+    /// which is a different question from what is currently carrying traffic -- with a VPN in
+    /// the way the latter is unknowable, and lighting a button on that basis would claim a
+    /// mode the user never chose.
+    pub applied_mode: Option<Mode>,
 }
 
 impl View {
@@ -39,6 +48,19 @@ impl View {
             .or_else(|| wifi_c.first().copied())
             .cloned();
         let verdict = snap.verdict(eth.as_ref().map(|n| n.luid), wifi.as_ref().map(|n| n.luid));
+        let (eth_ip_detached, bridge_note) = match eth.as_ref() {
+            Some(n) => (
+                net::binding::read(&n.adapter_name)
+                    .map(|b| !b.any())
+                    .unwrap_or(false),
+                net::binding::bridge_warning(&n.adapter_name),
+            ),
+            None => (false, None),
+        };
+        let journal = config::load_journal();
+        let applied_mode = (!journal.in_flight && journal.finished_unix.is_some())
+            .then_some(journal.mode);
+
         Self {
             snap,
             eth,
@@ -47,15 +69,28 @@ impl View {
             wifi_status: net::wifi::status(),
             policy: wcm::effective(),
             installed: install::is_installed(),
+            eth_ip_detached,
+            bridge_note,
+            applied_mode,
         }
     }
 
-    /// Which mode the machine is currently in, as far as we can tell from the routing table.
+    /// Which mode is in effect, for highlighting a button.
+    ///
+    /// Live state first where it is unambiguous, then the journal. Deliberately returns `None`
+    /// rather than guessing: when a VPN holds the default route there is no honest answer, and
+    /// lighting "Auto" in that situation would assert a mode the user never selected.
     pub fn active_mode(&self) -> Option<Mode> {
+        // A detached IP stack is definitive, and outranks the routing table -- which cannot
+        // tell it apart from an unplugged cable.
+        if self.eth_ip_detached {
+            return Some(Mode::WifiOnly);
+        }
         match self.verdict {
             Verdict::Ethernet { .. } => Some(Mode::Ethernet),
             Verdict::Wifi { .. } => Some(Mode::Wifi),
-            _ => None,
+            // Hijacked or None: fall back to what we last applied, if anything.
+            _ => self.applied_mode,
         }
     }
 }
@@ -127,6 +162,7 @@ impl App {
         self.error = None;
         self.status = Some(match mode {
             Mode::Wifi => "Connecting Wi-Fi and switching...".into(),
+            Mode::WifiOnly => "Detaching Ethernet's IP stack...".into(),
             Mode::Ethernet => "Switching to Ethernet...".into(),
             Mode::Auto => "Restoring automatic metrics...".into(),
         });
@@ -244,8 +280,8 @@ pub fn run() -> Result<(), String> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LinkSwitch")
-        .with_inner_size([330.0, 208.0])
-        .with_min_inner_size([330.0, 208.0])
+        .with_inner_size([340.0, 244.0])
+        .with_min_inner_size([340.0, 244.0])
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()

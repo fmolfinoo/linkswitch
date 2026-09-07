@@ -21,11 +21,11 @@
 
 use std::time::Duration;
 
-use crate::config::{self, MachineConfig, MetricBackup, Mode};
+use crate::config::{self, BindingBackup, MachineConfig, MetricBackup, Mode};
 use crate::lslog;
 use crate::net::adapters::{Nic, NicKind};
 use crate::net::routes::Verdict;
-use crate::net::{metric, wcm, wifi, LuidKey, Snapshot};
+use crate::net::{binding, metric, wcm, wifi, LuidKey, Snapshot};
 
 /// How long to wait for Wi-Fi to associate before giving up. Association on a known network is
 /// usually 2-4 s; 15 s covers a slow 6 GHz roam without making a failure feel like a hang.
@@ -42,6 +42,8 @@ pub mod exit {
     pub const WRITE_FAILED: u32 = 5;
     pub const VERIFY_FAILED: u32 = 6;
     pub const BLOCKED_BY_POLICY: u32 = 7;
+    /// The adapter's IP stack could not be detached or reattached.
+    pub const BINDING_FAILED: u32 = 8;
 }
 
 #[derive(Debug)]
@@ -127,6 +129,33 @@ fn restore_backups(backups: &[MetricBackup]) -> bool {
     all_ok
 }
 
+/// Put IP-protocol bindings back exactly as captured.
+///
+/// Writes the recorded tuple, never `(true, true)`. Rebinding a protocol we did not unbind
+/// would, on a machine with VPN IPv6 leak protection, switch IPv6 back on and leak the user's
+/// real address -- strictly worse than whatever it was trying to fix.
+fn restore_bindings(backups: &[BindingBackup]) -> bool {
+    let mut all_ok = true;
+    for b in backups {
+        let want = binding::BindingState { v4: b.v4, v6: b.v6 };
+        match binding::set(&b.guid, want) {
+            Ok(o) => lslog!(
+                "restore bindings {}: v4={} v6={} (changed={}, reboot={})",
+                b.guid,
+                b.v4,
+                b.v6,
+                o.changed,
+                o.needs_reboot
+            ),
+            Err(e) => {
+                all_ok = false;
+                lslog!("restore bindings {} failed: {}", b.guid, e.user_message());
+            }
+        }
+    }
+    all_ok
+}
+
 /// Undo a half-finished change left by a worker that was killed mid-apply.
 pub fn recover_if_torn() {
     let journal = config::load_journal();
@@ -138,7 +167,8 @@ pub fn recover_if_torn() {
         journal.mode.as_str(),
         journal.restore.len()
     );
-    let ok = restore_backups(&journal.restore);
+    // Bindings first: a metric is meaningless on an interface with no IP stack.
+    let ok = restore_bindings(&journal.bindings) & restore_backups(&journal.restore);
     let mut j = journal;
     j.in_flight = false;
     j.finished_unix = Some(config::now_unix());
@@ -148,6 +178,7 @@ pub fn recover_if_torn() {
         "recovery from an interrupted apply was incomplete".into()
     });
     j.restore.clear();
+    j.bindings.clear();
     let _ = config::save_journal(&j);
 }
 
@@ -189,10 +220,152 @@ pub fn apply(mode: Mode) -> ApplyReport {
         wifi.if_index
     );
 
+    // Leaving "Wi-Fi only" must reattach the IP stack before anything else. Setting a metric on
+    // an interface that has no IP stack is a no-op, so without this the switch would appear to
+    // do nothing at all.
+    if mode != Mode::WifiOnly {
+        let previous = config::load_journal();
+        if !previous.bindings.is_empty() {
+            lslog!("reattaching the IP stack detached by a previous wifi-only");
+            if !restore_bindings(&previous.bindings) {
+                return ApplyReport::fail(
+                    mode,
+                    exit::BINDING_FAILED,
+                    "Could not reattach Ethernet's IP stack. Run `linkswitch --recover`.",
+                );
+            }
+            let mut j = previous;
+            j.bindings.clear();
+            let _ = config::save_journal(&j);
+        }
+    }
+
     match mode {
         Mode::Wifi => apply_wifi(&cfg, eth, wifi),
+        Mode::WifiOnly => apply_wifi_only(&cfg, eth, wifi),
         Mode::Ethernet => apply_ethernet(&cfg, eth, wifi),
         Mode::Auto => apply_auto(eth, wifi),
+    }
+}
+
+/// Detach Ethernet's IP stack entirely, leaving Wi-Fi as the only IP link.
+fn apply_wifi_only(cfg: &MachineConfig, eth: &Nic, wifi: &Nic) -> ApplyReport {
+    let mode = Mode::WifiOnly;
+
+    let policy = wcm::effective();
+    if !policy.policy.permits_manual_wifi() {
+        return ApplyReport::fail(
+            mode,
+            exit::BLOCKED_BY_POLICY,
+            format!(
+                "{}. LinkSwitch cannot switch to Wi-Fi on this machine.",
+                policy.policy.describe()
+            ),
+        );
+    }
+
+    // PRE-FLIGHT. This mode removes Ethernet's ability to carry anything at all, so Wi-Fi being
+    // genuinely up first is not a nicety: getting it wrong strands the machine.
+    let profile = match wifi::ensure_connected(cfg.wifi_profile_hint.as_deref(), WIFI_TIMEOUT) {
+        Ok(p) => p,
+        Err(e) => {
+            lslog!("wifi-only pre-flight failed: {e:?}");
+            return ApplyReport::fail(mode, exit::WIFI_UNAVAILABLE, e.user_message());
+        }
+    };
+
+    let snap = Snapshot::read();
+    if crate::net::routes::total_for(&snap.routes, wifi.luid).is_none() {
+        return ApplyReport::fail(
+            mode,
+            exit::WIFI_UNAVAILABLE,
+            "Wi-Fi is connected but has no default route yet. Try again in a moment.",
+        );
+    }
+
+    // Capture the exact prior binding state before touching anything.
+    let before = match binding::read(&eth.adapter_name) {
+        Ok(b) => b,
+        Err(e) => return ApplyReport::fail(mode, exit::BINDING_FAILED, e.user_message()),
+    };
+    if !before.any() {
+        return ApplyReport::fail(
+            mode,
+            exit::BINDING_FAILED,
+            "Ethernet already has no IP stack attached.",
+        );
+    }
+
+    let mut journal = config::Journal {
+        schema: config::SCHEMA,
+        mode,
+        in_flight: true,
+        started_unix: config::now_unix(),
+        finished_unix: None,
+        restore: capture(eth.luid),
+        bindings: vec![BindingBackup {
+            guid: eth.adapter_name.clone(),
+            v4: before.v4,
+            v6: before.v6,
+        }],
+        last_error: None,
+    };
+    let _ = config::save_journal(&journal);
+
+    // Wi-Fi back on its automatic metric. Ethernet loses its IP stack outright, so there is no
+    // metric left on it to park.
+    let _ = metric::steer(wifi.luid, None);
+
+    let detached = binding::BindingState { v4: false, v6: false };
+    let outcome = match binding::set(&eth.adapter_name, detached) {
+        Ok(o) => o,
+        Err(e) => {
+            lslog!("wifi-only unbind failed: {}", e.user_message());
+            restore_bindings(&journal.bindings);
+            journal.in_flight = false;
+            journal.bindings.clear();
+            journal.restore.clear();
+            journal.last_error = Some(e.user_message());
+            journal.finished_unix = Some(config::now_unix());
+            let _ = config::save_journal(&journal);
+            return ApplyReport::fail(mode, exit::BINDING_FAILED, e.user_message());
+        }
+    };
+    lslog!(
+        "wifi-only: ethernet ip stack detached (changed={}, reboot={})",
+        outcome.changed,
+        outcome.needs_reboot
+    );
+
+    journal.in_flight = false;
+    journal.finished_unix = Some(config::now_unix());
+    let _ = config::save_journal(&journal);
+
+    if !profile.is_empty() {
+        let mut c = config::load_machine();
+        if c.wifi_profile_hint.as_deref() != Some(profile.as_str()) {
+            c.wifi_profile_hint = Some(profile.clone());
+            let _ = config::save_machine(&c);
+        }
+    }
+
+    let mut details = vec!["Ethernet has no IP address, routes or DNS servers.".to_string()];
+    // Honesty: this mode silences the IP stack, not the wire.
+    if let Some(w) = binding::bridge_warning(&eth.adapter_name) {
+        details.push(w);
+    }
+    if outcome.needs_reboot {
+        details.push("Windows asked for a reboot to finish applying this.".into());
+    }
+
+    ApplyReport {
+        mode,
+        ok: true,
+        exit_code: exit::OK,
+        message: "Ethernet's IP stack is detached. The cable is still plugged in and the adapter \
+                  is still enabled."
+            .into(),
+        details,
     }
 }
 
@@ -244,6 +417,7 @@ fn apply_wifi(cfg: &MachineConfig, eth: &Nic, wifi: &Nic) -> ApplyReport {
         started_unix: config::now_unix(),
         finished_unix: None,
         restore: backups.clone(),
+        bindings: Vec::new(),
         last_error: None,
     };
     let _ = config::save_journal(&journal);
@@ -293,6 +467,7 @@ fn apply_ethernet(cfg: &MachineConfig, eth: &Nic, wifi: &Nic) -> ApplyReport {
         started_unix: config::now_unix(),
         finished_unix: None,
         restore: backups.clone(),
+        bindings: Vec::new(),
         last_error: None,
     };
     let _ = config::save_journal(&journal);
@@ -344,6 +519,7 @@ fn apply_auto(eth: &Nic, wifi: &Nic) -> ApplyReport {
         started_unix: config::now_unix(),
         finished_unix: None,
         restore: backups.clone(),
+        bindings: Vec::new(),
         last_error: None,
     };
     let _ = config::save_journal(&journal);
@@ -431,6 +607,7 @@ fn finish(
         (Verdict::Ethernet { .. }, _) | (Verdict::Wifi { .. }, _) => match mode {
             Mode::Wifi => "Traffic now goes over Wi-Fi. Ethernet stays connected.".into(),
             Mode::Ethernet => "Traffic now goes over Ethernet.".into(),
+            Mode::WifiOnly => "Ethernet's IP stack is detached.".into(),
             Mode::Auto => "Automatic metrics restored.".into(),
         },
         (Verdict::Hijacked { if_index, .. }, _) => {

@@ -292,6 +292,27 @@ fn print_status(json: bool) {
         }
     }
 
+    for (label, n) in [("ethernet", eth), ("wi-fi", wifi)] {
+        let Some(n) = n else { continue };
+        match net::binding::read(&n.adapter_name) {
+            Ok(b) => {
+                println!(
+                    "  {:<17} IPv4 {}  IPv6 {}",
+                    format!("{label} ip stack:"),
+                    if b.v4 { "bound" } else { "UNBOUND" },
+                    if b.v6 { "bound" } else { "unbound" }
+                );
+                if let Some(w) = net::binding::bridge_warning(&n.adapter_name) {
+                    println!("                    note: {w}");
+                }
+            }
+            Err(e) => println!(
+                "  {:<17} unreadable - {}",
+                format!("{label} ip stack:"),
+                e.user_message()
+            ),
+        }
+    }
     println!("  carrying traffic: {}", describe_verdict(&verdict, &snap));
     println!("  windows policy:   {}", policy.policy.describe());
     if policy.is_group_policy {

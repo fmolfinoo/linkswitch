@@ -43,6 +43,12 @@ pub enum Mode {
     /// Wi-Fi wins. Ethernet stays enabled, link-up and reachable on its own subnet, so a NAS or
     /// printer on the wire keeps working.
     Wifi,
+    /// Wi-Fi carries traffic and Ethernet's IP stack is detached entirely: no addresses, no
+    /// routes, no DNS servers, no DHCP. The cable stays plugged in and the NIC stays enabled.
+    ///
+    /// This is zero *IP*, not zero *networking* -- LLDP, LLTD and any VM bridge still reach the
+    /// wire. The UI must say so rather than promise silence.
+    WifiOnly,
     /// Hand both interfaces back to Windows' automatic metrics.
     Auto,
 }
@@ -52,6 +58,7 @@ impl Mode {
         match self {
             Mode::Ethernet => "ethernet",
             Mode::Wifi => "wifi",
+            Mode::WifiOnly => "wifi-only",
             Mode::Auto => "auto",
         }
     }
@@ -60,6 +67,7 @@ impl Mode {
         match s.trim().to_ascii_lowercase().as_str() {
             "ethernet" | "eth" | "wired" => Some(Mode::Ethernet),
             "wifi" | "wi-fi" | "wireless" => Some(Mode::Wifi),
+            "wifi-only" | "wifionly" | "wi-fi-only" | "only" => Some(Mode::WifiOnly),
             "auto" | "automatic" | "restore" => Some(Mode::Auto),
             _ => None,
         }
@@ -70,6 +78,7 @@ impl Mode {
         match self {
             Mode::Ethernet => "ApplyEthernet",
             Mode::Wifi => "ApplyWifi",
+            Mode::WifiOnly => "ApplyWifiOnly",
             Mode::Auto => "ApplyAuto",
         }
     }
@@ -163,6 +172,19 @@ impl Default for MachineConfig {
     }
 }
 
+/// One adapter's IP-protocol bindings as they were before we touched them.
+///
+/// Restoring writes these exact values back. Never `(true, true)`: on this machine a VPN has
+/// already unbound `ms_tcpip6` for IPv6 leak protection, and "helpfully" rebinding it would
+/// switch IPv6 back on and leak the user's real address.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindingBackup {
+    /// Adapter GUID -- the handle INetCfg resolves by.
+    pub guid: String,
+    pub v4: bool,
+    pub v6: bool,
+}
+
 /// One interface/family metric as it was before we touched it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetricBackup {
@@ -194,6 +216,9 @@ pub struct Journal {
     /// Prior values for everything touched, so restore is exact rather than "set to default".
     #[serde(default)]
     pub restore: Vec<MetricBackup>,
+    /// Prior IP-protocol bindings, for the adapters whose stack we detached.
+    #[serde(default)]
+    pub bindings: Vec<BindingBackup>,
     #[serde(default)]
     pub last_error: Option<String>,
 }
@@ -207,6 +232,7 @@ impl Default for Journal {
             started_unix: 0,
             finished_unix: None,
             restore: Vec::new(),
+            bindings: Vec::new(),
             last_error: None,
         }
     }
@@ -215,7 +241,7 @@ impl Default for Journal {
 impl Journal {
     /// A previous run died between changing something and confirming it.
     pub fn is_torn(&self) -> bool {
-        self.in_flight && !self.restore.is_empty()
+        self.in_flight && !(self.restore.is_empty() && self.bindings.is_empty())
     }
 }
 

@@ -49,12 +49,12 @@ where
         "--apply" => {
             let Some(m) = it.next() else {
                 return Err(ParseError(
-                    "--apply needs a mode: ethernet, wifi or auto".into(),
+                    "--apply needs a mode: ethernet, wifi, wifi-only or auto".into(),
                 ));
             };
             let Some(mode) = Mode::parse(m) else {
                 return Err(ParseError(format!(
-                    "unknown mode \"{m}\"; expected ethernet, wifi or auto"
+                    "unknown mode \"{m}\"; expected ethernet, wifi, wifi-only or auto"
                 )));
             };
             reject_extra(it, Cmd::Apply(mode))
@@ -113,7 +113,8 @@ USAGE:
   linkswitch --install [OPTIONS] Set up: register the scheduled tasks that let the widget
                                  switch without a UAC prompt every time. Asks for admin once.
   linkswitch --uninstall         Restore every metric LinkSwitch changed and remove everything.
-  linkswitch --apply MODE        Apply a mode directly. MODE is ethernet, wifi or auto.
+  linkswitch --apply MODE        Apply a mode directly. MODE is ethernet, wifi, wifi-only
+                                 or auto.
                                  Needs admin; normally started by a scheduled task.
   linkswitch --recover           Undo a half-finished change left by an interrupted switch.
   linkswitch --help / --version
@@ -128,8 +129,12 @@ INSTALL OPTIONS:
 
 MODES:
   ethernet   Ethernet carries your traffic.
-  wifi       Wi-Fi carries your traffic. Ethernet stays connected and link-up, and keeps
-             serving its own subnet, so a NAS or printer on the wire still works.
+  wifi       Wi-Fi carries your traffic. Ethernet stays connected and keeps serving its own
+             subnet, so a NAS or printer on the wire still works.
+  wifi-only  As above, but Ethernet's IP stack is detached entirely: no address, no routes,
+             no DNS. The cable stays plugged in and the adapter stays enabled. This is zero
+             IP, not zero traffic -- LLDP, network discovery and any VM bridge still reach
+             the wire.
   auto       Hand both adapters back to Windows' automatic metrics.
 "#;
 
@@ -145,6 +150,10 @@ mod tests {
     #[test]
     fn apply_accepts_every_mode() {
         assert_eq!(parse(["--apply", "wifi"]), Ok(Cmd::Apply(Mode::Wifi)));
+        assert_eq!(
+            parse(["--apply", "wifi-only"]),
+            Ok(Cmd::Apply(Mode::WifiOnly))
+        );
         assert_eq!(
             parse(["--apply", "ethernet"]),
             Ok(Cmd::Apply(Mode::Ethernet))

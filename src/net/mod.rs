@@ -5,6 +5,7 @@
 //! only in the elevated worker.
 
 pub mod adapters;
+pub mod binding;
 pub mod err;
 pub mod luid;
 pub mod metric;
