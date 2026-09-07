@@ -24,6 +24,19 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "LinkSwitch";
 
+/// Where the Start menu looks for installed programs.
+///
+/// Windows' Start search indexes shortcuts here; it does not index executables sitting in
+/// Program Files. Without a `.lnk` the app is installed, running and auto-starting, and still
+/// completely unfindable by typing its name -- which is exactly how it behaved before this.
+fn start_menu_shortcut() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join(r"Microsoft\Windows\Start Menu\Programs")
+        .join("LinkSwitch.lnk")
+}
+
 pub fn install_dir() -> PathBuf {
     let base = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
@@ -176,7 +189,16 @@ pub fn install(keep_wifi: bool, autostart: bool) -> InstallOutcome {
         }
     }
 
-    // 6. Start the widget at logon. A per-user Run entry, not a task: it needs no privileges and
+    // 6. A Start menu entry, so typing "linkswitch" finds it.
+    match create_shortcut(&dest, &start_menu_shortcut()) {
+        Ok(()) => msgs.push(format!(
+            "Added a Start menu entry at {}.",
+            start_menu_shortcut().display()
+        )),
+        Err(e) => msgs.push(format!("Warning: could not create the Start menu entry: {e}")),
+    }
+
+    // 7. Start the widget at logon. A per-user Run entry, not a task: it needs no privileges and
     //    the user can see and remove it from Task Manager's Startup tab like any other app.
     if autostart {
         match set_autostart(Some(&dest)) {
@@ -240,6 +262,14 @@ pub fn uninstall() -> InstallOutcome {
 
     if let Err(e) = set_autostart(None) {
         msgs.push(format!("Warning: could not clear autostart: {e}"));
+    }
+
+    let lnk = start_menu_shortcut();
+    if lnk.exists() {
+        match std::fs::remove_file(&lnk) {
+            Ok(()) => msgs.push("Removed the Start menu entry.".into()),
+            Err(e) => msgs.push(format!("Warning: could not remove {}: {e}", lnk.display())),
+        }
     }
 
     // Leave the log behind on failure: it is the only record of what went wrong.
@@ -312,6 +342,58 @@ fn harden_dacl(dir: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Write a Start menu shortcut pointing at the installed executable.
+///
+/// Uses the shell's own `IShellLink` rather than shelling out to PowerShell: this runs inside an
+/// elevated installer, and a COM call is both cheaper and easier to audit than spawning a script
+/// host.
+fn create_shortcut(target: &Path, link: &Path) -> std::io::Result<()> {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    if let Some(dir) = link.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let to_io = |e: windows::core::Error| std::io::Error::other(e.to_string());
+
+    // SAFETY: standard in-process COM activation, balanced by CoUninitialize below. Every
+    // interface is released when it goes out of scope.
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // RPC_E_CHANGED_MODE means the thread is already MTA; proceed without uninitialising
+        // something we did not initialise.
+        let owned = hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        if owned {
+            hr.ok().map_err(to_io)?;
+        }
+
+        let result = (|| -> windows::core::Result<()> {
+            let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            sl.SetPath(&HSTRING::from(target.as_os_str()))?;
+            sl.SetDescription(&HSTRING::from(
+                "Turn Ethernet on and off without unplugging the cable",
+            ))?;
+            if let Some(dir) = target.parent() {
+                sl.SetWorkingDirectory(&HSTRING::from(dir.as_os_str()))?;
+            }
+            // Icon index 0 is the exe's own embedded icon.
+            sl.SetIconLocation(&HSTRING::from(target.as_os_str()), 0)?;
+            let pf: IPersistFile = sl.cast()?;
+            pf.Save(&HSTRING::from(link.as_os_str()), true)
+        })();
+
+        if owned {
+            CoUninitialize();
+        }
+        result.map_err(to_io)
+    }
 }
 
 /// Add or remove the per-user startup entry.
@@ -417,6 +499,17 @@ mod tests {
     #[test]
     fn user_data_is_separate_from_machine_data() {
         assert_ne!(config::user_dir(), config::machine_dir());
+    }
+
+    #[test]
+    fn the_start_menu_shortcut_goes_where_windows_indexes_it() {
+        // Start search indexes the Start Menu\Programs tree. A shortcut anywhere else -- or no
+        // shortcut at all, which is how this shipped first -- means typing the app's name finds
+        // nothing, even while it is installed and running.
+        let p = start_menu_shortcut();
+        let s = p.to_string_lossy().to_lowercase();
+        assert!(s.contains(r"start menu\programs"), "got {s}");
+        assert!(s.ends_with("linkswitch.lnk"), "got {s}");
     }
 
     #[test]
