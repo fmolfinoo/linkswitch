@@ -21,7 +21,7 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::{
     dot11_BSS_type_any, dot11_radio_state_off, wlan_connection_mode_profile,
     wlan_interface_state_connected, wlan_interface_state_not_ready,
-    wlan_intf_opcode_current_connection, wlan_intf_opcode_interface_state,
+    wlan_intf_opcode_current_connection,
     wlan_intf_opcode_radio_state, WlanCloseHandle, WlanConnect, WlanEnumInterfaces, WlanFreeMemory,
     WlanGetProfileList, WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES,
     WLAN_CONNECTION_PARAMETERS, WLAN_INTERFACE_INFO_LIST, WLAN_INTERFACE_STATE,

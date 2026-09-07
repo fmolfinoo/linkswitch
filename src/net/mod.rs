@@ -8,6 +8,7 @@ pub mod adapters;
 pub mod err;
 pub mod luid;
 pub mod metric;
+pub mod notify;
 pub mod routes;
 pub mod wcm;
 pub mod wifi;
